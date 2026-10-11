@@ -10,8 +10,9 @@
 - [x] **M1 对象库**:`init` / `hash-object` / `cat-file`。blob 采用
   `<type> <size>\0` 头 + zlib 压缩 + SHA-1,按 `objects/xx/yyyy...` 布局存盘,
   与真 git 完全兼容(同一文件得到同一个 SHA)。
-- [ ] **M2 暂存与提交**:`add`(index 文件)/ `write-tree` / `commit-tree` /
-  `commit` / `log`
+- [x] **M2 暂存与提交**:`add`(index 暂存区)/ `write-tree`(嵌套 tree 对象)/
+  `commit` / `log`。支持 `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` 固定日期;
+  固定作者与日期时,与真 git 对同一内容产出**相同的 commit SHA**(见 test_m2.py 对拍)。
 - [ ] **M3 引用**:`branch` / `checkout` / `tag`(轻量标签)
 - [ ] **M4 diff 与 status**:Myers diff 算法、index 与工作区对比
 - [ ] **M5(可选)**:packfile 与 `gc`
