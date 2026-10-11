@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# mygit 自身在测试/使用中生成的仓库数据
+.mygit/
