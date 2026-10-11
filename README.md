@@ -1,5 +1,8 @@
 # mygit — 从零实现迷你 git
 
+[![CI](https://github.com/zhengqiuyang/mygit/actions/workflows/ci.yml/badge.svg)](https://github.com/zhengqiuyang/mygit/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-informational.svg)](./LICENSE)
+
 对标真 git 逐步实现,每一步都用真 git **对拍验证**(同样的输入必须产出同样的对象哈希)。
 
 ## 里程碑
