@@ -5,6 +5,8 @@ M1 对象库:blob 的哈希与磁盘布局与真 git 完全兼容。
 M2 暂存与提交:index(暂存区)/ write-tree(嵌套 tree 对象)/ commit / log,
 tree 与 commit 对象同样与真 git 格式兼容——固定作者与日期时,
 对同一内容会产出和真 git 完全相同的 commit SHA。
+M3 引用与检出:branch / checkout(-b)/ tag(轻量与附注标签对象);
+checkout 会把工作区与暂存区同步到目标提交的树。
 """
 import argparse
 import hashlib
@@ -238,6 +240,107 @@ def parse_commit(sha):
     return info, parents, message
 
 
+# ---------- tree 读取与检出(M3) ----------
+
+def read_tree(sha):
+    """解析 tree 对象,返回 [(mode, name, hex_sha)]。"""
+    otype, body = read_object(sha)
+    if otype != "tree":
+        sys.exit(f"mygit: {sha[:12]}: not a tree")
+    entries = []
+    i = 0
+    while i < len(body):
+        j = body.index(b"\0", i)
+        mode, name = body[i:j].decode().split(" ", 1)
+        hex_sha = body[j + 1:j + 21].hex()
+        entries.append((mode, name, hex_sha))
+        i = j + 21
+    return entries
+
+
+def flatten_tree(tree_sha, prefix=""):
+    """递归展开 tree,返回 {path: (mode, sha)}。"""
+    files = {}
+    for mode, name, sha in read_tree(tree_sha):
+        path = prefix + name
+        if mode == "40000":
+            files.update(flatten_tree(sha, path + "/"))
+        else:
+            files[path] = (mode, sha)
+    return files
+
+
+def tree_from_commit(sha):
+    info, _, _ = parse_commit(sha)
+    return info["tree"]
+
+
+def _prune_empty_dirs(path, stop):
+    """删除 path 的空父目录链,直到 stop(不含)为止。"""
+    parent = os.path.dirname(path)
+    while parent.startswith(stop) and parent != stop:
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+
+
+def checkout_tree(commit_sha):
+    """把工作区与 index 同步到目标提交的树。
+    只删除旧 index 里跟踪、目标里没有的文件,不动未跟踪文件。"""
+    root = repo_root()
+    old_index = read_index()
+    target = flatten_tree(tree_from_commit(commit_sha))
+    for path in old_index:
+        if path not in target:
+            full = os.path.join(root, *path.split("/"))
+            if os.path.exists(full):
+                os.remove(full)
+                _prune_empty_dirs(full, root)
+    for path, (mode, sha) in target.items():
+        dest = os.path.join(root, *path.split("/"))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        _, blob = read_object(sha)
+        with open(dest, "wb") as f:
+            f.write(blob)
+    write_index(target)
+
+
+def _branch_names():
+    heads = git_path("refs", "heads")
+    if not os.path.isdir(heads):
+        return []
+    return sorted(os.listdir(heads))
+
+
+def _write_head(branch):
+    with open(git_path("HEAD"), "w", encoding="utf-8") as f:
+        f.write(f"ref: refs/heads/{branch}\n")
+
+
+def _create_branch(name):
+    if "/" in name:
+        sys.exit("mygit: M3 暂不支持包含 '/' 的分支名")
+    head = head_commit()
+    if head is None:
+        sys.exit("error: Not a valid object name: 还没有任何提交")
+    ref_file = git_path("refs", "heads", name)
+    if os.path.exists(ref_file):
+        sys.exit(f"fatal: a branch named '{name}' already exists")
+    os.makedirs(os.path.dirname(ref_file), exist_ok=True)
+    with open(ref_file, "w", encoding="utf-8") as f:
+        f.write(head + "\n")
+
+
+def _index_matches_head():
+    """index 是否与 HEAD 提交的树完全一致(无已暂存未提交的改动)。"""
+    head = head_commit()
+    if head is None:
+        return not read_index()
+    return read_index() == flatten_tree(tree_from_commit(head))
+
+
 # ---------- 子命令 ----------
 
 def cmd_init(args):
@@ -327,6 +430,82 @@ def cmd_log(args):
         first = False
 
 
+def cmd_branch(args):
+    repo_root()
+    if args.delete:
+        if args.name is None:
+            sys.exit("mygit: branch -d 需要一个分支名")
+        if args.name == head_branch():
+            sys.exit(f"error: cannot delete branch '{args.name}' checked out here")
+        ref_file = git_path("refs", "heads", args.name)
+        if not os.path.exists(ref_file):
+            sys.exit(f"error: branch '{args.name}' not found")
+        with open(ref_file, encoding="utf-8") as f:
+            sha = f.read().strip()
+        os.remove(ref_file)
+        print(f"Deleted branch {args.name} (was {sha[:7]}).")
+        return
+    if args.name is None:
+        current = head_branch()
+        for name in _branch_names():
+            print(("* " if name == current else "  ") + name)
+        return
+    _create_branch(args.name)
+
+
+def cmd_checkout(args):
+    repo_root()
+    if args.create:
+        _create_branch(args.branch)
+        _write_head(args.branch)
+        print(f"Switched to a new branch '{args.branch}'")
+        return
+    ref_file = git_path("refs", "heads", args.branch)
+    if not os.path.exists(ref_file):
+        sys.exit(f"error: pathspec '{args.branch}' did not match any branch")
+    if args.branch == head_branch():
+        print(f"Already on '{args.branch}'")
+        return
+    if not _index_matches_head():
+        sys.exit("error: your staged changes would be overwritten by checkout,\n"
+                 "please commit them before switching branches")
+    with open(ref_file, encoding="utf-8") as f:
+        target = f.read().strip()
+    checkout_tree(target)
+    _write_head(args.branch)
+    print(f"Switched to branch '{args.branch}'")
+
+
+def cmd_tag(args):
+    repo_root()
+    tags_dir = git_path("refs", "tags")
+    if args.name is None:
+        if os.path.isdir(tags_dir):
+            for name in sorted(os.listdir(tags_dir)):
+                print(name)
+        return
+    head = head_commit()
+    if head is None:
+        sys.exit("error: cannot tag: 还没有任何提交")
+    if args.annotate and not args.message:
+        sys.exit("mygit: 附注标签需要 -m 提供标签说明")
+    ref_file = os.path.join(tags_dir, args.name)
+    if os.path.exists(ref_file):
+        sys.exit(f"fatal: tag '{args.name}' already exists")
+    if args.annotate:
+        name, email = _config("user.name"), _config("user.email")
+        ts, tz = env_date("GIT_COMMITTER_DATE")
+        message = args.message if args.message.endswith("\n") else args.message + "\n"
+        body = (f"object {head}\ntype commit\ntag {args.name}\n"
+                f"tagger {name} <{email}> {ts} {tz}\n\n{message}")
+        sha = write_object(body.encode("utf-8"), "tag")
+    else:
+        sha = head
+    os.makedirs(tags_dir, exist_ok=True)
+    with open(ref_file, "w", encoding="utf-8") as f:
+        f.write(sha + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="mygit", description="a miniature git")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -340,7 +519,7 @@ def main():
 
     p = sub.add_parser("cat-file", help="print an object's contents")
     p.add_argument("object")
-    p.add_argument("-t", dest="type", choices=["blob", "tree", "commit"],
+    p.add_argument("-t", dest="type", choices=["blob", "tree", "commit", "tag"],
                    help="expected type")
     p.set_defaults(fn=cmd_cat_file)
 
@@ -357,6 +536,24 @@ def main():
 
     p = sub.add_parser("log", help="show commit history")
     p.set_defaults(fn=cmd_log)
+
+    p = sub.add_parser("branch", help="list, create, or delete branches")
+    p.add_argument("name", nargs="?")
+    p.add_argument("-d", dest="delete", action="store_true")
+    p.set_defaults(fn=cmd_branch)
+
+    p = sub.add_parser("checkout", help="switch branches (syncs worktree)")
+    p.add_argument("branch")
+    p.add_argument("-b", dest="create", action="store_true",
+                   help="create the branch before switching")
+    p.set_defaults(fn=cmd_checkout)
+
+    p = sub.add_parser("tag", help="list or create tags")
+    p.add_argument("name", nargs="?")
+    p.add_argument("-a", "--annotate", action="store_true",
+                   help="create an annotated tag object")
+    p.add_argument("-m", "--message")
+    p.set_defaults(fn=cmd_tag)
 
     args = parser.parse_args()
     args.fn(args)

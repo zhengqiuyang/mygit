@@ -13,7 +13,9 @@
 - [x] **M2 暂存与提交**:`add`(index 暂存区)/ `write-tree`(嵌套 tree 对象)/
   `commit` / `log`。支持 `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` 固定日期;
   固定作者与日期时,与真 git 对同一内容产出**相同的 commit SHA**(见 test_m2.py 对拍)。
-- [ ] **M3 引用**:`branch` / `checkout` / `tag`(轻量标签)
+- [x] **M3 引用**:`branch`(列表/创建/删除)/ `checkout`(含 `-b`,
+  同步工作区与暂存区,拒绝有已暂存改动时切换)/ `tag`(轻量 + 附注标签对象)。
+  附注标签对象与真 git 格式完全兼容——固定身份与日期时 SHA 一致(见 test_m3.py)。
 - [ ] **M4 diff 与 status**:Myers diff 算法、index 与工作区对比
 - [ ] **M5(可选)**:packfile 与 `gc`
 
