@@ -9,6 +9,8 @@ M3 引用与检出:branch / checkout(-b)/ tag(轻量与附注标签对象);
 checkout 会把工作区与暂存区同步到目标提交的树。
 M4 diff 与 status:Myers O(ND) 最短编辑距离算法、unified diff 输出、
 status(已暂存/未暂存/未跟踪三区对比)。
+M5 packfile 与 gc:PACK v2 / IDX v2 真实格式(无 delta),
+gc 把 loose 对象打包并在校验后删除;对象读取自动回退到 pack。
 """
 import argparse
 import hashlib
@@ -57,16 +59,111 @@ def write_object(data, otype="blob"):
 
 
 def read_object(sha):
+    """读对象:先 loose,再 pack。"""
     path = object_path(sha)
-    if not os.path.exists(path):
-        sys.exit(f"mygit: {sha[:12]}: object not found")
-    with open(path, "rb") as f:
-        raw = zlib.decompress(f.read())
-    header, _, body = raw.partition(b"\0")
-    otype, size = header.decode().split()
-    if int(size) != len(body):
-        sys.exit(f"mygit: {sha[:12]}: corrupt object (size mismatch)")
-    return otype, body
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            raw = zlib.decompress(f.read())
+        header, _, body = raw.partition(b"\0")
+        otype, size = header.decode().split()
+        if int(size) != len(body):
+            sys.exit(f"mygit: {sha[:12]}: corrupt object (size mismatch)")
+        return otype, body
+    for pack_path in _list_packs():
+        _shas, offsets = _load_idx(pack_path)
+        if sha in offsets:
+            return _read_packed_object(pack_path, offsets[sha])
+    sys.exit(f"mygit: {sha[:12]}: object not found")
+
+
+# ---------- packfile:PACK v2 / IDX v2(M5) ----------
+
+PACK_TYPE_NUM = {"commit": 1, "tree": 2, "blob": 3, "tag": 4}
+PACK_TYPE_NAME = {num: name for name, num in PACK_TYPE_NUM.items()}
+IDX_MAGIC = b"\xfftOc"
+
+_pack_cache = {}  # idx 路径 -> (sha 列表, {sha: 偏移})
+
+
+def _encode_pack_header(otype, size):
+    """pack 对象头:type 3 位 + 变长 7 位组编码的 size。"""
+    byte = (PACK_TYPE_NUM[otype] << 4) | (size & 0x0F)
+    size >>= 4
+    out = bytearray()
+    while size:
+        out.append(byte | 0x80)
+        byte = size & 0x7F
+        size >>= 7
+    out.append(byte)
+    return bytes(out)
+
+
+def _pack_dir():
+    return git_path("objects", "pack")
+
+
+def _list_packs():
+    pack_dir = _pack_dir()
+    if not os.path.isdir(pack_dir):
+        return []
+    return sorted(os.path.join(pack_dir, name)
+                  for name in os.listdir(pack_dir) if name.endswith(".pack"))
+
+
+def _load_idx(pack_path):
+    idx_path = pack_path[:-len(".pack")] + ".idx"
+    cached = _pack_cache.get(idx_path)
+    if cached is not None:
+        return cached
+    with open(idx_path, "rb") as f:
+        data = f.read()
+    if data[:4] != IDX_MAGIC or int.from_bytes(data[4:8], "big") != 2:
+        sys.exit(f"mygit: {idx_path}: 不支持的 idx 格式")
+    count = int.from_bytes(data[8 + 255 * 4:8 + 256 * 4], "big")
+    shas_start = 8 + 256 * 4
+    shas = [data[shas_start + 20 * i:shas_start + 20 * (i + 1)].hex()
+            for i in range(count)]
+    offsets_start = shas_start + count * 20 + count * 4  # 跳过 crc32 表
+    offsets = {}
+    for i, sha in enumerate(shas):
+        offset = int.from_bytes(
+            data[offsets_start + 4 * i:offsets_start + 4 * (i + 1)], "big")
+        if offset & 0x80000000:
+            sys.exit(f"mygit: {idx_path}: 大 pack(64 位偏移)暂不支持")
+        offsets[sha] = offset & 0x7FFFFFFF
+    _pack_cache[idx_path] = (shas, offsets)
+    return shas, offsets
+
+
+def _read_packed_object(pack_path, offset):
+    with open(pack_path, "rb") as f:
+        f.seek(offset)
+        byte = f.read(1)[0]
+        otype = (byte >> 4) & 0x07
+        size = byte & 0x0F
+        shift = 4
+        while byte & 0x80:
+            byte = f.read(1)[0]
+            size |= (byte & 0x7F) << shift
+            shift += 7
+        if otype not in PACK_TYPE_NAME:
+            sys.exit(f"mygit: pack 中出现 delta 对象(type {otype}),M5 暂不支持")
+        content = zlib.decompressobj().decompress(f.read())
+    if len(content) != size:
+        sys.exit(f"mygit: {pack_path}: pack 对象大小不匹配")
+    return PACK_TYPE_NAME[otype], content
+
+
+def _iter_loose_objects():
+    objects_dir = git_path("objects")
+    if not os.path.isdir(objects_dir):
+        return
+    for sub in sorted(os.listdir(objects_dir)):
+        if len(sub) != 2:
+            continue  # 跳过 pack 目录等
+        subdir = os.path.join(objects_dir, sub)
+        for name in sorted(os.listdir(subdir)):
+            yield sub + name, os.path.join(subdir, name)
 
 
 # ---------- 引用:HEAD 与分支(M2) ----------
@@ -737,6 +834,75 @@ def cmd_status(args):
         print("\nnothing to commit, working tree clean")
 
 
+def cmd_gc(args):
+    repo_root()
+    loose = list(_iter_loose_objects())
+    if not loose:
+        print("nothing to pack(没有 loose 对象)")
+        return
+    # 读出全部 loose 对象,idx 要求按 sha 有序
+    objects = []
+    for sha, path in loose:
+        with open(path, "rb") as f:
+            raw = zlib.decompress(f.read())
+        header, _, body = raw.partition(b"\0")
+        otype, _size = header.decode().split()
+        objects.append((sha, otype, body))
+    objects.sort(key=lambda item: item[0])
+
+    # 组装 PACK v2
+    pack = bytearray(b"PACK" + (2).to_bytes(4, "big")
+                     + len(objects).to_bytes(4, "big"))
+    entries = []  # (sha, offset, crc32)
+    for sha, otype, body in objects:
+        offset = len(pack)
+        chunk = _encode_pack_header(otype, len(body)) + zlib.compress(body)
+        pack += chunk
+        entries.append((sha, offset, zlib.crc32(chunk) & 0xFFFFFFFF))
+    pack_sha = hashlib.sha1(pack).hexdigest()
+    pack += bytes.fromhex(pack_sha)
+
+    # 组装 IDX v2:magic+version, 256 fanout, sha 表, crc32 表, 偏移表, 双校验和
+    idx = bytearray(IDX_MAGIC + (2).to_bytes(4, "big"))
+    shas = [entry[0] for entry in entries]
+    for i in range(256):
+        count = sum(1 for s in shas if int(s[:2], 16) <= i)
+        idx += count.to_bytes(4, "big")
+    for sha in shas:
+        idx += bytes.fromhex(sha)
+    for _sha, _offset, crc in entries:
+        idx += crc.to_bytes(4, "big")
+    for _sha, offset, _crc in entries:
+        if offset >= 0x80000000:
+            sys.exit("mygit: pack 超过 2GB,大偏移表暂不支持")
+        idx += offset.to_bytes(4, "big")
+    idx += bytes.fromhex(pack_sha)
+    idx += hashlib.sha1(idx).digest()
+
+    pack_dir = _pack_dir()
+    os.makedirs(pack_dir, exist_ok=True)
+    pack_path = os.path.join(pack_dir, f"pack-{pack_sha}.pack")
+    idx_path = os.path.join(pack_dir, f"pack-{pack_sha}.idx")
+    with open(pack_path, "wb") as f:
+        f.write(pack)
+    with open(idx_path, "wb") as f:
+        f.write(idx)
+
+    # 从 pack 读回逐个校验,全部通过才删 loose
+    _shas, offsets = _load_idx(pack_path)
+    for sha, otype, body in objects:
+        got_type, got_body = _read_packed_object(pack_path, offsets[sha])
+        if got_type != otype or got_body != body:
+            sys.exit(f"mygit: pack 校验失败,loose 对象已保留:{sha[:12]}")
+    for _sha, path in loose:
+        os.remove(path)
+        try:
+            os.rmdir(os.path.dirname(path))
+        except OSError:
+            pass
+    print(f"packed {len(objects)} objects into pack-{pack_sha[:8]}")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="mygit", description="a miniature git")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -794,6 +960,9 @@ def main():
 
     p = sub.add_parser("status", help="show staged/unstaged/untracked changes")
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("gc", help="pack loose objects (PACK/IDX v2, no deltas)")
+    p.set_defaults(fn=cmd_gc)
 
     args = parser.parse_args()
     args.fn(args)

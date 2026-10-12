@@ -20,7 +20,10 @@
   (`@@ -a,b +c,d @@` 带上下文 hunk,`diff` 工作区对比、`diff --staged` 暂存区对比、
   新文件/删除文件/Binary files 提示);`status` 三区对比(已暂存/未暂存/未跟踪)。
   与真 `git diff` 的正文输出对拍一致。
-- [ ] **M5(可选)**:packfile 与 `gc`
+- [x] **M5 packfile 与 gc**:`gc` 把 loose 对象打包成真实的 PACK v2 / IDX v2
+  格式(fanout 表、CRC32、双重 SHA-1 校验和,无 delta),读回逐对象校验通过才删源;
+  对象读取自动回退 pack,loose 与 pack 可混用。**真 git 可直接读 mygit 打包后的仓库**
+  (`.mygit` 改名 `.git` 后 `git log` / `git show` / `git verify-pack` 全部通过)。
 
 ## 对拍验证(M1)
 
