@@ -7,6 +7,8 @@ tree 与 commit 对象同样与真 git 格式兼容——固定作者与日期�
 对同一内容会产出和真 git 完全相同的 commit SHA。
 M3 引用与检出:branch / checkout(-b)/ tag(轻量与附注标签对象);
 checkout 会把工作区与暂存区同步到目标提交的树。
+M4 diff 与 status:Myers O(ND) 最短编辑距离算法、unified diff 输出、
+status(已暂存/未暂存/未跟踪三区对比)。
 """
 import argparse
 import hashlib
@@ -341,6 +343,162 @@ def _index_matches_head():
     return read_index() == flatten_tree(tree_from_commit(head))
 
 
+# ---------- diff:Myers 算法与 unified diff(M4) ----------
+
+def myers_ops(a, b):
+    """Myers O(ND) 最短编辑脚本 + 回溯。返回自上而下的操作序列
+    [('=', 行), ('-', 旧行), ('+', 新行)],其中 '-'/'+' 的总数最小。"""
+    n, m = len(a), len(b)
+    v = {1: 0}
+    trace = []
+    total_d = None
+    for d in range(n + m + 1):
+        trace.append(dict(v))
+        for k in range(-d, d + 1, 2):
+            if k == -d or (k != d and v.get(k - 1, -1) < v.get(k + 1, -1)):
+                x = v.get(k + 1, 0)
+            else:
+                x = v.get(k - 1, 0) + 1
+            y = x - k
+            while x < n and y < m and a[x] == b[y]:
+                x += 1
+                y += 1
+            v[k] = x
+            if x >= n and y >= m:
+                total_d = d
+                break
+        if total_d is not None:
+            break
+    ops = []
+    x, y = n, m
+    for d in range(total_d, 0, -1):
+        v_prev = trace[d]
+        k = x - y
+        if k == -d or (k != d and v_prev.get(k - 1, -1) < v_prev.get(k + 1, -1)):
+            prev_k = k + 1
+        else:
+            prev_k = k - 1
+        prev_x = v_prev.get(prev_k, 0)
+        prev_y = prev_x - prev_k
+        while x > prev_x and y > prev_y:
+            ops.append(("=", a[x - 1]))
+            x, y = x - 1, y - 1
+        if x == prev_x:      # down:插入 b 的一行
+            ops.append(("+", b[prev_y]))
+        else:                # right:删除 a 的一行
+            ops.append(("-", a[prev_x]))
+        x, y = prev_x, prev_y
+    while x > 0 and y > 0:   # d=0 的对角线
+        ops.append(("=", a[x - 1]))
+        x, y = x - 1, y - 1
+    ops.reverse()
+    return ops
+
+
+def make_hunks(ops, context=3):
+    """把操作序列切成带上下文的 hunk。
+    返回 [(a_start, a_stop, b_start, b_stop, [(前缀, 行)])],行号 0 基、半开区间。"""
+    if not any(op != "=" for op, _ in ops):
+        return []
+    ann = []
+    a_no = b_no = 0
+    for op, line in ops:
+        ann.append((op, line, a_no, b_no))
+        if op == "=":
+            a_no += 1
+            b_no += 1
+        elif op == "-":
+            a_no += 1
+        else:
+            b_no += 1
+    a_total, b_total = a_no, b_no
+    # 变更区段
+    regions = []
+    start = None
+    for i, (op, *_rest) in enumerate(ann):
+        if op != "=" and start is None:
+            start = i
+        elif op == "=" and start is not None:
+            regions.append((start, i))
+            start = None
+    if start is not None:
+        regions.append((start, len(ann)))
+    # 间隔不超过 2*context 的区段合并成一个 hunk
+    merged = [list(regions[0])]
+    for s, e in regions[1:]:
+        if s - merged[-1][1] <= 2 * context:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    hunks = []
+    n = len(ann)
+    for s, e in merged:
+        s = max(0, s - context)
+        e = min(n, e + context)
+        seg = ann[s:e]
+        a_start, b_start = seg[0][2], seg[0][3]
+        if e < n:
+            a_stop, b_stop = ann[e][2], ann[e][3]
+        else:
+            a_stop, b_stop = a_total, b_total
+        lines = [(" " if op == "=" else op, line) for op, line, *_r in seg]
+        hunks.append((a_start, a_stop, b_start, b_stop, lines))
+    return hunks
+
+
+def format_range(start, stop):
+    length = stop - start
+    beginning = start + 1 if length > 0 else start
+    if length == 1:
+        return str(beginning)
+    return f"{beginning},{length}"
+
+
+def blob_sha_of(data):
+    """只算 blob 哈希、不落盘。"""
+    return hashlib.sha1(f"blob {len(data)}".encode() + b"\0" + data).hexdigest()
+
+
+def print_file_diff(path, old_bytes, new_bytes, status, mode):
+    """按 git 风格打印一个文件的 unified diff。"""
+    print(f"diff --git a/{path} b/{path}")
+    if status == "new":
+        print(f"new file mode {mode}")
+    elif status == "deleted":
+        print(f"deleted file mode {mode}")
+    old7 = blob_sha_of(old_bytes)[:7] if old_bytes is not None else "0000000"
+    new7 = blob_sha_of(new_bytes)[:7] if new_bytes is not None else "0000000"
+    print(f"index {old7}..{new7} {mode}")
+    if (old_bytes is not None and b"\0" in old_bytes) or \
+            (new_bytes is not None and b"\0" in new_bytes):
+        print(f"Binary files a/{path} and b/{path} differ")
+        return
+    print("--- a/" + path if old_bytes is not None else "--- /dev/null")
+    print("+++ b/" + path if new_bytes is not None else "+++ /dev/null")
+    a = old_bytes.decode("utf-8", "replace").splitlines() if old_bytes else []
+    b = new_bytes.decode("utf-8", "replace").splitlines() if new_bytes else []
+    for a0, a1, b0, b1, seg in make_hunks(myers_ops(a, b)):
+        print(f"@@ -{format_range(a0, a1)} +{format_range(b0, b1)} @@")
+        for prefix, line in seg:
+            print(prefix + line)
+
+
+def _diff_sides(old_files, new_files, load_old, load_new):
+    """old_files/new_files: {path: (mode, sha)},逐文件输出 diff。"""
+    for path in sorted(set(old_files) | set(new_files)):
+        old = old_files.get(path)
+        new = new_files.get(path)
+        if old == new:
+            continue
+        old_bytes = load_old(path, old) if old else None
+        new_bytes = load_new(path, new) if new else None
+        if old and new and old_bytes == new_bytes:
+            continue  # 只有 mode 不同,M4 不展开
+        status = "new" if old is None else ("deleted" if new is None else None)
+        mode = (new or old)[0]
+        print_file_diff(path, old_bytes, new_bytes, status, mode)
+
+
 # ---------- 子命令 ----------
 
 def cmd_init(args):
@@ -506,6 +664,79 @@ def cmd_tag(args):
         f.write(sha + "\n")
 
 
+def cmd_diff(args):
+    repo_root()
+    index = read_index()
+    if args.cached or args.staged:
+        head = head_commit()
+        old_files = flatten_tree(tree_from_commit(head)) if head else {}
+
+        def load_object(path, entry):
+            return read_object(entry[1])[1]
+
+        _diff_sides(old_files, dict(index), load_object, load_object)
+        return
+    root = repo_root()
+    disk = {}
+    new_files = {}
+    for path, entry in index.items():
+        full = os.path.join(root, *path.split("/"))
+        if os.path.isfile(full):
+            with open(full, "rb") as f:
+                disk[path] = f.read()
+            # 新侧的身份是磁盘内容的哈希,而不是 index 里的旧 sha
+            new_files[path] = (entry[0], blob_sha_of(disk[path]))
+    _diff_sides(dict(index), new_files,
+                lambda p, e: read_object(e[1])[1],
+                lambda p, e: disk[p])
+
+
+def cmd_status(args):
+    root = repo_root()
+    print(f"On branch {head_branch() or '(无提交)'}")
+    head = head_commit()
+    head_files = flatten_tree(tree_from_commit(head)) if head else {}
+    index = read_index()
+    staged = []
+    for path in sorted(set(head_files) | set(index)):
+        h = head_files.get(path)
+        i = index.get(path)
+        if h == i:
+            continue
+        if h is None:
+            staged.append(("new file", path))
+        elif i is None:
+            staged.append(("deleted", path))
+        else:
+            staged.append(("modified", path))
+    unstaged = []
+    for path in sorted(index):
+        full = os.path.join(root, *path.split("/"))
+        if not os.path.isfile(full):
+            unstaged.append(("deleted", path))
+            continue
+        with open(full, "rb") as f:
+            data = f.read()
+        if blob_sha_of(data) != index[path][1]:
+            unstaged.append(("modified", path))
+    untracked = sorted(rel for _full, rel in iter_worktree_files(root)
+                       if rel not in index)
+    if staged:
+        print("\nChanges to be committed:")
+        for kind, path in staged:
+            print(f"  {kind + ':':<12}{path}")
+    if unstaged:
+        print("\nChanges not staged for commit:")
+        for kind, path in unstaged:
+            print(f"  {kind + ':':<12}{path}")
+    if untracked:
+        print("\nUntracked files:")
+        for path in untracked:
+            print(f"  {path}")
+    if not (staged or unstaged or untracked):
+        print("\nnothing to commit, working tree clean")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="mygit", description="a miniature git")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -554,6 +785,15 @@ def main():
                    help="create an annotated tag object")
     p.add_argument("-m", "--message")
     p.set_defaults(fn=cmd_tag)
+
+    p = sub.add_parser("diff", help="show changes (worktree vs index; "
+                                    "--staged: index vs HEAD)")
+    p.add_argument("--cached", action="store_true")
+    p.add_argument("--staged", action="store_true")
+    p.set_defaults(fn=cmd_diff)
+
+    p = sub.add_parser("status", help="show staged/unstaged/untracked changes")
+    p.set_defaults(fn=cmd_status)
 
     args = parser.parse_args()
     args.fn(args)
